@@ -541,7 +541,13 @@ async def main():
         asyncio.create_task(set_webhook_forever(bot))
 
     logging.info("Server started. Webhook path: %s", WEBHOOK_PATH)
-    await asyncio.Event().wait()
+    task = asyncio.create_task(admin.daily_backup(bot))
+    try:
+        await asyncio.Event().wait()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

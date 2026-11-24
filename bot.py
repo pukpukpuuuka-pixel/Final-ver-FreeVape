@@ -523,4 +523,29 @@ async def main():
         username=os.getenv("BOT_USERNAME") or None,
     )
 
-    init_bot_d
+    app = create_app()  # создаёт папку и основные таблицы БД
+    init_bot_db()
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
+        app, path=WEBHOOK_PATH
+    )
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
+
+    if AUTO_SET_WEBHOOK:
+        asyncio.create_task(set_webhook_forever(bot))
+
+    logging.info("Server started. Webhook path: %s", WEBHOOK_PATH)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+        logging.exception("BOT CRASHED")
+        raise
+        

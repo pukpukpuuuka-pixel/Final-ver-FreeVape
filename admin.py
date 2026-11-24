@@ -31,13 +31,31 @@ def audit(uid, action):
     with db() as c: c.execute('INSERT INTO staff_audit(uid,action,at) VALUES(?,?,?)',(uid,action,int(time.time())))
 
 def keyboard(items):
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,callback_data='ops:'+v)] for t,v in items])
+    rows, pending = [], []
+    for text, value in items:
+        button = InlineKeyboardButton(text=text, callback_data='ops:'+value)
+        full = value == 'home' or (value.startswith('profile:') and text not in ('❌ Отмена', 'Отмена')) or value.startswith('confirm:')
+        if full:
+            if pending: rows.append(pending); pending=[]
+            rows.append([button])
+        else:
+            pending.append(button)
+            if len(pending)==2: rows.append(pending); pending=[]
+    if pending: rows.append(pending)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def panel(r):
-    items=[('📨 Обращения','tickets'),('📊 Активность','activity')]
-    if r in ('owner','admin'): items += [('🛡 Модерация V4','safety'),('📋 Журнал','logs'),('🛠 Техработы','maintenance'),('📈 Графики','charts'),('👤 Последняя активность','recent'),('👥 Пользователи','users:0'),('🚫 Заблокированные','banned:0'),('🔎 Поиск пользователя','search'),('📊 Состояние базы','health')]
-    if r=='owner': items += [('💾 Бэкап','backup'),('👥 Администраторы','staff'),('📢 Сервисное уведомление','notice')]
+    items=[]
+    if r in ('owner','admin'):
+        items += [('👥 Пользователи','users:0'),('🔎 Поиск','search'),('🚫 Бан-лист','banned:0'),('🛡 Модерация','safety'),('📨 Обращения','tickets'),('📋 Журнал','logs'),('📊 Активность','activity'),('📈 Графики','charts'),('🕒 Посещения','recent'),('🗄 База данных','health'),('🚧 Техработы','maintenance')]
+    else:
+        items += [('📨 Обращения','tickets'),('📊 Активность','activity')]
+    if r=='owner': items += [('💾 Бэкап','backup'),('👑 Админы','staff'),('📢 Уведомления','notice')]
     return keyboard(items)
+
+def panel_title(r):
+    name={'owner':'Владелец','admin':'Администратор','support':'Поддержка'}.get(r,'')
+    return f'⚙️ FREEVAPE ADMIN • V4\n━━━━━━━━━━━━━━━━\n👤 Роль: {name}\n\nВыберите раздел управления:'
 
 def backup_file(path):
     with sqlite3.connect(DB_PATH) as source, sqlite3.connect(path) as dest: source.backup(dest)
@@ -57,10 +75,10 @@ async def screen(message, uid, action):
         return
     if action=='safety' and r in ('owner','admin'):
         await message.answer('/tempban ID минуты причина\n/warn ID причина\n/violations ID\n/priority ID low|normal|high\n/assign_ticket ID ID_сотрудника\n/reopen_ticket ID\n/maintenance_for минуты\n/diagnostics',reply_markup=panel(r)); return
-    if action=='home': await message.answer('Панель управления',reply_markup=panel(r)); return
+    if action=='home': await message.answer(panel_title(r),reply_markup=panel(r)); return
     if action=='backup' and r=='owner': await backup(message); return
     if action=='charts' and r in ('owner','admin'): await charts(message); return
-    if action=='notice' and r=='owner': await message.answer('/notice maintenance — технические работы\n/notice restored — восстановление'); return
+    if action=='notice' and r=='owner': await message.answer('📢 Сервисные уведомления\n\n/notice maintenance — технические работы\n/notice restored — восстановление',reply_markup=keyboard([('🏠 Главная','home')])); return
     with db() as c:
         if action=='staff' and r=='owner':
             out='Владелец: '+str(OWNER)+'\n'+ '\n'.join(f'{x[0]} — {x[1]}' for x in c.execute('SELECT uid,role FROM staff_roles'))+'\n/staff ID admin|support|remove'
@@ -101,7 +119,7 @@ def register(dp):
     @dp.message(Command('admin','ops'), F.chat.type=='private')
     async def menu(m):
         r=role(m.from_user.id)
-        if r: await m.answer('Панель управления',reply_markup=panel(r))
+        if r: await m.answer(panel_title(r),reply_markup=panel(r))
 
     @dp.callback_query(F.data.startswith('ops:'))
     async def callback(q:CallbackQuery):
@@ -117,7 +135,7 @@ def register(dp):
             if not arg: await m.answer('/finduser ID или username'); return
             with db() as c:
                 rows=c.execute("SELECT user_id,username FROM users WHERE CAST(user_id AS TEXT)=? OR username LIKE ? ESCAPE '\\' LIMIT 20",(arg,'%'+arg.lstrip('@').replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%')).fetchall()
-            await m.answer('Результаты поиска' if rows else 'Не найдено',reply_markup=keyboard([(f'{x[0]} @{x[1] or "—"}',f'profile:{x[0]}') for x in rows]+[('Назад','home')]))
+            await m.answer('Результаты поиска' if rows else 'Не найдено',reply_markup=keyboard([(f'{x[0]} @{x[1] or "—"}',f'profile:{x[0]}') for x in rows]+[('⬅️ Назад','home')]))
             return
         parts=arg.split(maxsplit=1)
         if not parts or not parts[0].isdigit() or len(parts[0])>18: await m.answer('Укажи корректный ID'); return
@@ -231,14 +249,14 @@ async def charts(message):
 async def moderation(message, actor, action):
     if role(actor) not in ('owner','admin'): return
     p=action.split(':'); kind=p[0]
-    if kind=='search': await message.answer('/finduser ID или username\n/modnote ID текст — внутренняя заметка'); return
+    if kind=='search': await message.answer('🔎 Поиск пользователя\n\n/finduser ID или username\n/modnote ID текст — внутренняя заметка',reply_markup=keyboard([('🏠 Главная','home')])); return
     if kind=='health':
         with db() as c:
             counts=[(t,c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]) for t in ('users','support_tickets','staff_audit','activity_events','moderation_notes')]
-        await message.answer('Состояние базы\n'+'\n'.join(f'{t}: {n}' for t,n in counts)+f'\nРазмер файла: {os.path.getsize(DB_PATH)} байт',reply_markup=keyboard([('Назад','home')])); return
+        await message.answer('Состояние базы\n'+'\n'.join(f'{t}: {n}' for t,n in counts)+f'\nРазмер файла: {os.path.getsize(DB_PATH)} байт',reply_markup=keyboard([('⬅️ Назад','home')])); return
     if kind=='confirm':
         if len(p)!=3 or p[1] not in ('block','allow') or not p[2].isdigit() or len(p[2])>18: return
-        await message.answer(f'Подтвердить {"блокировку" if p[1]=="block" else "разблокировку"} ID {p[2]}?',reply_markup=keyboard([('Подтвердить',f'{p[1]}:{p[2]}'),('Отмена',f'profile:{p[2]}')])); return
+        await message.answer(f'Подтвердить {"блокировку" if p[1]=="block" else "разблокировку"} ID {p[2]}?',reply_markup=keyboard([('✅ Подтвердить',f'{p[1]}:{p[2]}'),('❌ Отмена',f'profile:{p[2]}')])); return
     if len(p)!=2 or not p[1].isdigit() or len(p[1])>18: return
     n=int(p[1])
     if kind in ('users','banned'):
@@ -247,7 +265,7 @@ async def moderation(message, actor, action):
         items=[(f'{"🚫" if x[2] else "👤"} {x[0]} @{x[1] or "—"}',f'profile:{x[0]}') for x in rows[:10]]
         if n: items.append(('⬅️ Назад',f'{kind}:{max(0,n-10)}'))
         if len(rows)>10: items.append(('Далее ➡️',f'{kind}:{n+10}'))
-        await message.answer('Заблокированные' if kind=='banned' else 'Пользователи',reply_markup=keyboard(items+[('Главная','home')])); return
+        await message.answer('Заблокированные' if kind=='banned' else 'Пользователи',reply_markup=keyboard(items+[('🏠 Главная','home')])); return
     if kind in ('block','allow'):
         if role(n): await message.answer('Нельзя блокировать или изменять блокировку сотрудника'); return
         with db() as c:
@@ -264,5 +282,5 @@ async def moderation(message, actor, action):
     if not u: await message.answer('Пользователь не найден'); return
     out=f'ID: {n}\nИмя: {u["full_name"] or "—"}\nUsername: @{u["username"] or "—"}\nСтатус: {"заблокирован" if u["banned"] else "активен"}\nПоследняя активность: {time.strftime("%d.%m.%Y %H:%M",time.gmtime(last)) if last else "нет данных"} UTC\nОбращений: {tickets}\nЗаметки:\n'+'\n'.join(x[0] for x in notes)
     items=[] if role(n) else [('Разбанить' if u['banned'] else 'Забанить',f'confirm:{"allow" if u["banned"] else "block"}:{n}')]
-    await message.answer(out[:3900],reply_markup=keyboard(items+[('Пользователи','users:0'),('Главная','home')]))
-    
+    await message.answer(out[:3900],reply_markup=keyboard(items+[('Пользователи','users:0'),('🏠 Главная','home')]))
+            

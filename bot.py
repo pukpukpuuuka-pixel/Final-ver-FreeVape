@@ -24,7 +24,9 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "https://mellifluous-pika-bf5e4c.netlify.ap
 
 WEBHOOK_PATH = "/tg-webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "freevape-secret-123")
-PUBLIC_URL = os.getenv("PUBLIC_URL") or f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
+PUBLIC_URL = os.getenv("PUBLIC_URL") or f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN', 'example.com')}"
+# 1 = бот сам ставит webhook при старте (в фоне), 0 = webhook поставлен вручную
+AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "0") == "1"
 
 dp = Dispatcher()
 
@@ -91,6 +93,24 @@ async def to_support(message: Message, bot: Bot):
     await message.answer("✅ Сообщение отправлено в поддержку. Скоро ответим!")
 
 
+async def set_webhook_forever(bot: Bot):
+    while True:
+        try:
+            await bot.set_webhook(
+                PUBLIC_URL + WEBHOOK_PATH,
+                secret_token=WEBHOOK_SECRET,
+                drop_pending_updates=True,
+            )
+            logging.info("Webhook set: %s", PUBLIC_URL + WEBHOOK_PATH)
+            return
+        except TelegramRetryAfter as e:
+            logging.warning("Flood control, жду %s сек", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception:
+            logging.exception("set_webhook failed")
+            await asyncio.sleep(30)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(BOT_TOKEN)
@@ -112,22 +132,12 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
 
-    while True:
-        try:
-            await bot.set_webhook(
-                PUBLIC_URL + WEBHOOK_PATH,
-                secret_token=WEBHOOK_SECRET,
-                drop_pending_updates=True,
-            )
-            break
-        except TelegramRetryAfter as e:
-            logging.warning("Flood control, жду %s сек", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
+    if AUTO_SET_WEBHOOK:
+        asyncio.create_task(set_webhook_forever(bot))
 
-    logging.info("Webhook set: %s", PUBLIC_URL + WEBHOOK_PATH)
+    logging.info("Server started. Webhook path: %s", WEBHOOK_PATH)
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

@@ -11,6 +11,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    User,
     WebAppInfo,
 )
 
@@ -92,6 +93,14 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
 
     bot = Bot(BOT_TOKEN)
+    # Не делаем запрос GetMe при старте (Telegram отбивает его флудом):
+    # ID бота берём из токена, имя бота необязательно.
+    bot._me = User(
+        id=int(BOT_TOKEN.split(":")[0]),
+        is_bot=True,
+        first_name="FreeVape",
+        username=os.getenv("BOT_USERNAME") or None,
+    )
     while True:
         try:
             await dp.start_polling(bot)
@@ -103,3 +112,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

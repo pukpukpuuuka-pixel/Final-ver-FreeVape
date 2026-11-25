@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -11,6 +12,7 @@ import time
 from contextlib import contextmanager
 from urllib.parse import parse_qsl, unquote
 
+import aiohttp
 from aiohttp import web
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -18,6 +20,22 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 # База лежит на Railway Volume (путь /data), иначе данные пропадут при деплое
 DB_PATH = os.getenv("DB_PATH") or ("/data/freevape.db" if os.path.isdir("/data") else "freevape.db")
+
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://mellifluous-pika-bf5e4c.netlify.app")
+
+# Админы бота (числовые Telegram ID). Дополнительно: переменные Railway ADMIN_ID / ADMIN_IDS (через запятую)
+ADMIN_IDS = {7944549421, 8839872292, 6739188141}
+for _x in [os.getenv("ADMIN_ID", "")] + os.getenv("ADMIN_IDS", "").split(","):
+    if _x.strip().isdigit():
+        ADMIN_IDS.add(int(_x.strip()))
+
+ORDER_STATUSES = {
+    "new": "🆕 Новый",
+    "accepted": "✅ Принят",
+    "shipped": "🚚 Отправлен",
+    "done": "✔️ Выполнен",
+    "cancelled": "❌ Отменён",
+}
 
 CORS = {
     "Access-Control-Allow-Origin": "*",
@@ -73,8 +91,36 @@ def init_db():
                 at INTEGER NOT NULL,
                 PRIMARY KEY(code, user_id)
             );
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS orders(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                items TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                unpriced INTEGER NOT NULL DEFAULT 0,
+                promo_code TEXT,
+                percent INTEGER NOT NULL DEFAULT 0,
+                comment TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'new',
+                created INTEGER NOT NULL,
+                updated INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS orders_user ON orders(user_id, created);
+            CREATE TABLE IF NOT EXISTS stock_subs(
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                PRIMARY KEY(user_id, product_id)
+            );
             """
         )
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(products)")]
+        if "in_stock" not in cols:
+            c.execute("ALTER TABLE products ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 1")
     logging.info("DB: %s", DB_PATH)
 
 
@@ -98,10 +144,10 @@ def check_admin(request: web.Request):
         raise ApiError("Неверный пароль", 401)
 
 
-def tg_user_id(request: web.Request) -> int:
-    """Проверяет подпись Telegram и возвращает ID пользователя."""
+def tg_user(request: web.Request) -> dict:
+    """Проверяет подпись Telegram и возвращает данные пользователя."""
     init_data = request.headers.get("X-Telegram-Init-Data", "")
-    err = ApiError("Открой магазин через Telegram, чтобы использовать промокод", 401)
+    err = ApiError("Открой магазин через Telegram", 401)
     if not init_data:
         raise err
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
@@ -116,9 +162,114 @@ def tg_user_id(request: web.Request) -> int:
     try:
         if time.time() - int(pairs.get("auth_date", "0")) > 3 * 86400:
             raise ApiError("Сессия устарела, закрой и снова открой магазин", 401)
-        return int(json.loads(pairs["user"])["id"])
+        user = json.loads(pairs["user"])
+        int(user["id"])
+        return user
     except (KeyError, ValueError, TypeError):
         raise err
+
+
+def tg_user_id(request: web.Request) -> int:
+    return int(tg_user(request)["id"])
+
+
+# ---------- TELEGRAM (отправка сообщений с сервера) ----------
+_http: aiohttp.ClientSession | None = None
+
+
+async def tg_call(method: str, payload: dict):
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+    for attempt in range(2):
+        try:
+            async with _http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload
+            ) as r:
+                data = await r.json()
+            if data.get("ok"):
+                return data
+            if data.get("error_code") == 429 and attempt == 0:
+                wait = data.get("parameters", {}).get("retry_after", 1)
+                await asyncio.sleep(min(wait, 10) + 0.5)
+                continue
+            logging.warning("Telegram %s failed: %s", method, data)
+            return None
+        except Exception:
+            logging.exception("Telegram %s error", method)
+            return None
+    return None
+
+
+def money(n: int) -> str:
+    return f"{int(n):,}".replace(",", " ") + " ₽"
+
+
+def order_text(o) -> str:
+    items = json.loads(o["items"])
+    lines = []
+    for i in items:
+        if i["price"]:
+            lines.append(f"• {i['name']} × {i['qty']} — {money(i['price'] * i['qty'])}")
+        else:
+            lines.append(f"• {i['name']} × {i['qty']} — цена по запросу")
+    total = f"Итого: {money(o['total'])}"
+    if o["percent"]:
+        total += f" (скидка {o['percent']}%, промокод {o['promo_code']})"
+    if o["unpriced"]:
+        total += "\n+ товары с ценой по запросу"
+    who = f"{o['full_name'] or '—'} ({'@' + o['username'] if o['username'] else 'нет username'})"
+    text = (
+        f"🛒 Заказ №{o['id']}\n"
+        f"👤 {who}\n"
+        f"ID: {o['user_id']}\n\n"
+        + "\n".join(lines)
+        + f"\n\n{total}"
+    )
+    if o["comment"]:
+        text += f"\n\n💬 Комментарий: {o['comment']}"
+    text += f"\n\nСтатус: {ORDER_STATUSES.get(o['status'], o['status'])}"
+    return text
+
+
+def order_buttons(oid: int, back: bool = False) -> dict:
+    rows = [
+        [
+            {"text": "✅ Принять", "callback_data": f"ord:set:{oid}:accepted"},
+            {"text": "🚚 Отправлен", "callback_data": f"ord:set:{oid}:shipped"},
+        ],
+        [
+            {"text": "✔️ Выполнен", "callback_data": f"ord:set:{oid}:done"},
+            {"text": "❌ Отменить", "callback_data": f"ord:set:{oid}:cancelled"},
+        ],
+    ]
+    if back:
+        rows.append([{"text": "⬅️ К заказам", "callback_data": "adm:orders"}])
+    return {"inline_keyboard": rows}
+
+
+async def notify_admins_order(oid: int):
+    with db() as c:
+        o = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not o:
+        return
+    text, kb = order_text(o), order_buttons(oid)
+    for aid in ADMIN_IDS:
+        await tg_call("sendMessage", {"chat_id": aid, "text": text, "reply_markup": kb})
+        await asyncio.sleep(0.05)
+
+
+async def notify_stock(pid: int, name: str):
+    with db() as c:
+        ids = [r["user_id"] for r in c.execute("SELECT user_id FROM stock_subs WHERE product_id=?", (pid,))]
+        c.execute("DELETE FROM stock_subs WHERE product_id=?", (pid,))
+    kb = {"inline_keyboard": [[{"text": "🛍 Открыть каталог", "web_app": {"url": WEBAPP_URL}}]]}
+    for uid in ids:
+        await tg_call(
+            "sendMessage",
+            {"chat_id": uid, "text": f"🔔 «{name}» снова в наличии!", "reply_markup": kb},
+        )
+        await asyncio.sleep(0.06)
 
 
 async def read_json(request: web.Request) -> dict:
@@ -171,7 +322,7 @@ async def root(request):
 async def list_products(request):
     with db() as c:
         rows = c.execute(
-            "SELECT id,name,category,description,price,updated,"
+            "SELECT id,name,category,description,price,updated,in_stock,"
             "image IS NOT NULL AS has_image FROM products ORDER BY id"
         ).fetchall()
     products = [
@@ -181,6 +332,7 @@ async def list_products(request):
             "category": r["category"],
             "description": r["description"],
             "price": r["price"],
+            "in_stock": bool(r["in_stock"]),
             "image": f"/api/products/{r['id']}/image?v={r['updated']}" if r["has_image"] else None,
         }
         for r in rows
@@ -244,6 +396,131 @@ async def promo_redeem(request):
     return web.json_response({"promo": {"code": code, "percent": promo["percent"]}})
 
 
+async def banner(request):
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='banner'").fetchone()
+    return web.json_response({"text": row["value"] if row else ""}, headers={"Cache-Control": "no-store"})
+
+
+async def subs_mine(request):
+    uid = tg_user_id(request)
+    with db() as c:
+        rows = c.execute("SELECT product_id FROM stock_subs WHERE user_id=?", (uid,)).fetchall()
+    return web.json_response({"ids": [r["product_id"] for r in rows]})
+
+
+async def product_notify(request):
+    """Подписка/отписка «сообщить о поступлении»."""
+    uid = tg_user_id(request)
+    pid = int(request.match_info["id"])
+    with db() as c:
+        p = c.execute("SELECT in_stock FROM products WHERE id=?", (pid,)).fetchone()
+        if not p:
+            raise ApiError("Товар не найден", 404)
+        has = c.execute(
+            "SELECT 1 FROM stock_subs WHERE user_id=? AND product_id=?", (uid, pid)
+        ).fetchone()
+        if has:
+            c.execute("DELETE FROM stock_subs WHERE user_id=? AND product_id=?", (uid, pid))
+            return web.json_response({"subscribed": False})
+        if p["in_stock"]:
+            raise ApiError("Этот товар уже в наличии")
+        c.execute("INSERT INTO stock_subs(user_id,product_id) VALUES(?,?)", (uid, pid))
+    return web.json_response({"subscribed": True})
+
+
+async def orders_create(request):
+    user = tg_user(request)
+    uid = int(user["id"])
+    body = await read_json(request)
+    raw = body.get("items")
+    if not isinstance(raw, list) or not raw or len(raw) > 30:
+        raise ApiError("Корзина пуста")
+    comment = str(body.get("comment", "")).strip()[:500]
+
+    merged: dict[int, int] = {}
+    for it in raw:
+        try:
+            pid, qty = int(it["id"]), int(it["qty"])
+        except (KeyError, TypeError, ValueError):
+            raise ApiError("Некорректная корзина")
+        if qty < 1 or qty > 20:
+            raise ApiError("Количество должно быть от 1 до 20")
+        merged[pid] = min(20, merged.get(pid, 0) + qty)
+
+    now = int(time.time())
+    with db() as c:
+        recent = c.execute(
+            "SELECT COUNT(*) FROM orders WHERE user_id=? AND created>?", (uid, now - 3600)
+        ).fetchone()[0]
+        if recent >= 5:
+            raise ApiError("Слишком много заказов за час, попробуй позже", 429)
+
+        promo = c.execute(
+            "SELECT r.code, p.percent FROM redemptions r JOIN promos p ON p.code=r.code "
+            "WHERE r.user_id=? ORDER BY r.at DESC, r.rowid DESC LIMIT 1",
+            (uid,),
+        ).fetchone()
+        percent = promo["percent"] if promo else 0
+
+        items, total, unpriced = [], 0, 0
+        for pid, qty in merged.items():
+            p = c.execute("SELECT id,name,price,in_stock FROM products WHERE id=?", (pid,)).fetchone()
+            if not p:
+                raise ApiError("Один из товаров больше недоступен, обнови каталог")
+            if not p["in_stock"]:
+                raise ApiError(f"«{p['name']}» нет в наличии")
+            items.append({"id": p["id"], "name": p["name"], "price": p["price"], "qty": qty})
+            if p["price"]:
+                total += (p["price"] * (100 - percent) * 2 + 100) // 200 * qty
+            else:
+                unpriced = 1
+
+        cur = c.execute(
+            "INSERT INTO orders(user_id,username,full_name,items,total,unpriced,promo_code,percent,comment,status,created,updated) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                uid,
+                user.get("username"),
+                " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or None,
+                json.dumps(items, ensure_ascii=False),
+                total,
+                unpriced,
+                promo["code"] if promo else None,
+                percent,
+                comment,
+                "new",
+                now,
+                now,
+            ),
+        )
+        oid = cur.lastrowid
+    asyncio.create_task(notify_admins_order(oid))
+    return web.json_response({"id": oid, "total": total, "unpriced": bool(unpriced)})
+
+
+async def orders_mine(request):
+    uid = tg_user_id(request)
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,)
+        ).fetchall()
+    out = [
+        {
+            "id": r["id"],
+            "items": json.loads(r["items"]),
+            "total": r["total"],
+            "unpriced": bool(r["unpriced"]),
+            "percent": r["percent"],
+            "status": r["status"],
+            "status_label": ORDER_STATUSES.get(r["status"], r["status"]),
+            "created": r["created"],
+        }
+        for r in rows
+    ]
+    return web.json_response({"orders": out}, headers={"Cache-Control": "no-store"})
+
+
 # ---------- АДМИН ----------
 async def admin_login(request):
     check_admin(request)
@@ -263,6 +540,10 @@ async def admin_save_product(request):
     except (TypeError, ValueError):
         raise ApiError("Некорректная цена")
 
+    in_stock = None
+    if "in_stock" in body:
+        in_stock = 0 if body["in_stock"] in (0, False, "0", "false") else 1
+
     set_image = "image" in body
     raw = mime = None
     if set_image and body["image"]:
@@ -270,22 +551,27 @@ async def admin_save_product(request):
 
     pid = body.get("id")
     now = int(time.time())
+    back_in_stock = False
     with db() as c:
         if pid:
             try:
                 pid = int(pid)
             except (TypeError, ValueError):
                 raise ApiError("Некорректный товар")
-            if not c.execute("SELECT 1 FROM products WHERE id=?", (pid,)).fetchone():
+            old = c.execute("SELECT in_stock FROM products WHERE id=?", (pid,)).fetchone()
+            if not old:
                 raise ApiError("Товар не найден", 404)
             c.execute(
                 "UPDATE products SET name=?,category=?,description=?,price=?,updated=? WHERE id=?",
                 (name, category, description, price, now, pid),
             )
+            if in_stock is not None:
+                c.execute("UPDATE products SET in_stock=? WHERE id=?", (in_stock, pid))
+                back_in_stock = old["in_stock"] == 0 and in_stock == 1
         else:
             cur = c.execute(
-                "INSERT INTO products(name,category,description,price,updated) VALUES(?,?,?,?,?)",
-                (name, category, description, price, now),
+                "INSERT INTO products(name,category,description,price,updated,in_stock) VALUES(?,?,?,?,?,?)",
+                (name, category, description, price, now, 1 if in_stock is None else in_stock),
             )
             pid = cur.lastrowid
         if set_image:
@@ -293,6 +579,8 @@ async def admin_save_product(request):
                 c.execute("UPDATE products SET image=?, image_mime=? WHERE id=?", (raw, mime, pid))
             else:
                 c.execute("UPDATE products SET image=NULL, image_mime=NULL WHERE id=?", (pid,))
+    if back_in_stock:
+        asyncio.create_task(notify_stock(pid, name))
     return web.json_response({"ok": True, "id": pid})
 
 
@@ -301,6 +589,7 @@ async def admin_delete_product(request):
     pid = int(request.match_info["id"])
     with db() as c:
         c.execute("DELETE FROM products WHERE id=?", (pid,))
+        c.execute("DELETE FROM stock_subs WHERE product_id=?", (pid,))
     return web.json_response({"ok": True})
 
 
@@ -360,6 +649,11 @@ def create_app() -> web.Application:
             web.get(r"/api/products/{id:\d+}/image", product_image),
             web.get("/api/promo/mine", promo_mine),
             web.post("/api/promo/redeem", promo_redeem),
+            web.get("/api/banner", banner),
+            web.get("/api/subs/mine", subs_mine),
+            web.post(r"/api/products/{id:\d+}/notify", product_notify),
+            web.post("/api/orders", orders_create),
+            web.get("/api/orders/mine", orders_mine),
             web.post("/api/admin/login", admin_login),
             web.post("/api/admin/products", admin_save_product),
             web.delete(r"/api/admin/products/{id:\d+}", admin_delete_product),
@@ -369,3 +663,4 @@ def create_app() -> web.Application:
         ]
     )
     return app
+    
